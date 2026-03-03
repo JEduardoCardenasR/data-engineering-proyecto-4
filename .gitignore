@@ -1,0 +1,5 @@
+# Carpeta de datos
+data/
+
+# Credenciales (no subir .env)
+.env
