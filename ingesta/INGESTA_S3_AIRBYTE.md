@@ -1,8 +1,10 @@
-# Documentación: Ingesta de datos a S3 y configuración Airbyte
+# Documentación: Ingesta a S3 mediante Airbyte
 
 **Fecha:** 2 de marzo de 2026  
 **Proyecto:** data-engineering-proyecto-4  
 **Documento de referencia (solo lectura).**
+
+Este documento describe únicamente la **ingesta de datos a S3 a través de Airbyte** (datos en streaming desde OpenWeather). Para la subida de archivos JSON locales (históricos) a S3, véase **[INGESTA_JSON_LOCAL.md](INGESTA_JSON_LOCAL.md)**.
 
 ---
 
@@ -31,6 +33,8 @@ data-engineer-modulo-cuatro-raw/
 | `historicos/Riohacha/` | Archivos históricos de Riohacha (subida manual desde código) |
 | `stream/Patagonia/` | Datos ingeridos por Airbyte (conexión Patagonia) |
 | `stream/Riohacha/` | Datos ingeridos por Airbyte (conexión Riohacha) |
+
+*Los datos en `historicos/` se cargan desde archivos JSON locales; véase [INGESTA_JSON_LOCAL.md](INGESTA_JSON_LOCAL.md).*
 
 ---
 
@@ -106,52 +110,22 @@ La API key se configura únicamente en el **Source** de OpenWeather dentro de Ai
 
 ---
 
-## 5. Verificación de datos en S3
+## 5. Verificación de datos en S3 (Airbyte)
 
-Se verificó que los datos ingeridos por Airbyte y los subidos por código aparecen correctamente en la consola de S3:
+Se verificó que los datos ingeridos por Airbyte aparecen correctamente en la consola de S3 en las rutas de streaming:
 
-- **Rutas exactas de verificación:**
+- **Rutas de verificación (Airbyte):**
   - `s3://data-engineer-modulo-cuatro-raw/stream/Patagonia/`
   - `s3://data-engineer-modulo-cuatro-raw/stream/Riohacha/`
-  - `s3://data-engineer-modulo-cuatro-raw/historicos/Patagonia/`
-  - `s3://data-engineer-modulo-cuatro-raw/historicos/Riohacha/`
 
 La comprobación se realizó revisando la presencia y estructura de los objetos en dichas rutas desde la consola de AWS S3.
 
 ---
 
-## 6. Subida de datos desde código (históricos)
-
-Los archivos históricos (Patagonia y Riohacha) se suben al bucket mediante scripts del propio repositorio, no por Airbyte.
-
-### Componentes
-
-| Archivo | Descripción |
-|---------|-------------|
-| `data/con_s3.py` | Módulo con la lógica de conexión a S3 y función de subida (usa credenciales del `.env` en la raíz del proyecto). |
-| `data/upload_historicos_to_s3.py` | Script que sube `Riohacha_11_538415.json` y `Patagonia_-41.json` a `historicos/Riohacha/` y `historicos/Patagonia/` respectivamente. |
-
-### Requisitos
-
-- Variables en `.env` (raíz del proyecto): `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
-- Dependencias: `pip install -r requirements.txt` (boto3, python-dotenv).
-
-### Ejecución
-
-Desde la raíz del proyecto:
-
-```bash
-python data/upload_historicos_to_s3.py
-```
-
-Los archivos deben estar en la carpeta `data/` con los nombres `Riohacha_11_538415.json` y `Patagonia_-41.json`.
-
----
-
-## 7. Diagrama del pipeline
+## 6. Diagrama del pipeline
 
 El diagrama de arquitectura del pipeline ETLT se encuentra en la carpeta **`diseño_pipeline/`** (incluye el notebook de documentación y el diagrama en formato Draw.io).
 
 ---
 
-*Documento generado como referencia de la configuración de ingesta a S3 y uso de Airbyte para el proyecto data-engineering-proyecto-4.*
+*Documento de referencia de la ingesta a S3 mediante Airbyte para el proyecto data-engineering-proyecto-4. Para la ingesta desde archivos JSON locales, véase [INGESTA_JSON_LOCAL.md](INGESTA_JSON_LOCAL.md).*
