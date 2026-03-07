@@ -249,9 +249,119 @@ Interfaz web de Spark: `http://<IP_PUBLICA>:8080`. Progreso del job: `http://<IP
 
 ### 1. Scripts PySpark para preguntas de negocio
 
-- **Capa Silver**: limpieza, aplanado de esquemas (JSON/JSONL) y escritura en Parquet.
-- **Capa Gold**: agregaciones, índices de potencial eólico (WPI) y solar (SPI).
-- Las preguntas de negocio se responden en el **reporte** del proyecto usando estas tablas.
+**Capa Silver — Transformaciones aplicadas:**
+
+| Entrada (Raw) | Transformación | Salida (Silver) |
+|---------------|----------------|-----------------|
+| JSON anidado (OpenWeatherMap) | Aplana estructuras (`safe_flatten_structs`) | Columnas planas |
+| Nombres variados (`main.temp`, `wind.speed`) | Estandariza columnas | Nombres consistentes (`temperatura_c`, `velocidad_viento_m_s`) |
+| Datos sucios (nulos, inválidos) | Filtra registros sin ciudad/temperatura/timestamp | Datos limpios |
+| JSON / JSONL.GZ | Convierte formato | Parquet particionado (ciudad/event_year) |
+| Históricos + Stream separados | Une con `unionByName` | Dataset unificado |
+
+**Capa Gold — Transformaciones aplicadas:**
+
+| Entrada (Silver) | Transformación | Salida (Gold) |
+|------------------|----------------|---------------|
+| `timestamp_iso` (timestamp) | Extrae `fecha_solo`, `hora_solo`, `mes_anio` | Campos temporales para agrupación |
+| `velocidad_viento_m_s` | Calcula WPI = `(velocidad³) / 100` | `potencial_eolico_index` |
+| `indice_uv`, `nubes_porcentaje` | Calcula SPI = `UV × (1 - nubes/100)` | `potencial_solar_index` |
+| Registros horarios | `groupBy(ciudad, mes_anio, fecha_solo)` + agregaciones | `resumen_clima_diario` (1 fila/día) |
+| Registros horarios | `groupBy(ciudad, mes_anio, hora_solo)` + agregaciones | `patrones_horarios` (24 filas/mes) |
+| Parquet (Silver) | Convierte a Parquet particionado | Parquet (ciudad/mes_anio) |
+
+**Cálculos de índices de potencial energético:**
+
+| Índice | Fórmula | Descripción |
+|--------|---------|-------------|
+| **WPI** (Wind Potential Index) | `round(pow(velocidad_viento_m_s, 3) / 100, 2)` | Potencial eólico proporcional al cubo de la velocidad del viento. Se divide por 100 para normalizar el rango. |
+| **SPI** (Solar Potential Index) | `round(indice_uv × (1 - nubes_porcentaje/100), 2)` | Potencial solar basado en UV, atenuado por nubosidad. Si UV es nulo, usa valor base de 5.0. |
+
+**Tabla `resumen_clima_diario` — Agregaciones por día:**
+
+| Campo | Cálculo | Descripción |
+|-------|---------|-------------|
+| `promedio_potencial_eolico_diario` | `avg(potencial_eolico_index)` | Promedio del WPI del día |
+| `max_potencial_eolico_diario` | `max(potencial_eolico_index)` | Máximo WPI del día |
+| `min_potencial_eolico_diario` | `min(potencial_eolico_index)` | Mínimo WPI del día |
+| `promedio_potencial_solar_diario` | `avg(potencial_solar_index)` | Promedio del SPI del día |
+| `max_potencial_solar_diario` | `max(potencial_solar_index)` | Máximo SPI del día |
+| `min_potencial_solar_diario` | `min(potencial_solar_index)` | Mínimo SPI del día |
+| `promedio_temperatura_diaria_c` | `avg(temperatura_c)` | Temperatura promedio del día |
+| `max_temperatura_registro_c` | `max(temperatura_c)` | Temperatura máxima del día |
+| `min_temperatura_registro_c` | `min(temperatura_c)` | Temperatura mínima del día |
+| `promedio_humedad_diaria` | `avg(humedad_porcentaje)` | Humedad promedio del día |
+| `total_precipitacion_diaria_mm` | `sum(lluvia_1h_mm)` | Precipitación total acumulada |
+| `max_velocidad_viento_m_s` | `max(velocidad_viento_m_s)` | Ráfaga máxima del día |
+| `promedio_nubes_diario` | `avg(nubes_porcentaje)` | Nubosidad promedio del día |
+| `fecha_procesamiento_gold` | `current_timestamp()` | Timestamp de auditoría |
+
+**Tabla `patrones_horarios` — Agregaciones por hora/mes:**
+
+| Campo | Cálculo | Descripción |
+|-------|---------|-------------|
+| `promedio_eolico_por_hora_mes` | `avg(potencial_eolico_index)` | Promedio WPI por hora del día en el mes |
+| `promedio_solar_por_hora_mes` | `avg(potencial_solar_index)` | Promedio SPI por hora del día en el mes |
+| `promedio_temperatura_por_hora_mes` | `avg(temperatura_c)` | Temperatura promedio por hora en el mes |
+| `promedio_humedad_por_hora_mes` | `avg(humedad_porcentaje)` | Humedad promedio por hora en el mes |
+| `id_analisis_patron` | `concat(ciudad, mes_anio, hora_solo)` | ID único del patrón (ej: "Patagonia-2026-03-14") |
+| `fecha_procesamiento_gold` | `current_timestamp()` | Timestamp de auditoría |
+
+**Flujo de transformación Gold:**
+
+```
+Silver (Parquet)
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  1. Lectura condicional (primera ejecución vs incremental)  │
+│     - Primera: lee todo Silver                              │
+│     - Incremental: filtra event_year + mes_anio actual      │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. Preparación de campos temporales                        │
+│     - fecha_hora_utc = cast(timestamp_iso)                  │
+│     - fecha_solo = to_date(fecha_hora_utc)                  │
+│     - hora_solo = date_format(HH)                           │
+│     - mes_anio = date_format(yyyy-MM)                       │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. Cálculo de índices de potencial energético              │
+│     - WPI = (velocidad_viento³) / 100                       │
+│     - SPI = UV × (1 - nubes/100)                            │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  4. Cache del DataFrame (optimización)                      │
+│     - Evita releer S3 en las dos agregaciones               │
+└─────────────────────────────────────────────────────────────┘
+     │
+     ├────────────────────────┬────────────────────────────────┐
+     ▼                        ▼                                │
+┌──────────────────┐   ┌──────────────────┐                    │
+│ groupBy(ciudad,  │   │ groupBy(ciudad,  │                    │
+│ mes_anio,        │   │ mes_anio,        │                    │
+│ fecha_solo)      │   │ hora_solo)       │                    │
+│                  │   │                  │                    │
+│ → Agregaciones   │   │ → Agregaciones   │                    │
+│   diarias        │   │   por hora/mes   │                    │
+└────────┬─────────┘   └────────┬─────────┘                    │
+         │                      │                              │
+         ▼                      ▼                              │
+┌──────────────────┐   ┌──────────────────┐                    │
+│ resumen_clima_   │   │ patrones_        │                    │
+│ diario           │   │ horarios         │                    │
+│ (Parquet)        │   │ (Parquet)        │                    │
+│ ciudad/mes_anio  │   │ ciudad/mes_anio  │                    │
+└──────────────────┘   └──────────────────┘                    │
+```
+
+Las preguntas de negocio se responden en el **reporte** del proyecto usando estas tablas.
 
 ### 2. Combinación de datos no estructurados y estructurados
 
@@ -261,9 +371,16 @@ Interfaz web de Spark: `http://<IP_PUBLICA>:8080`. Progreso del job: `http://<IP
 
 ### 3. Optimización en Apache Spark
 
-- **Particionamiento**: Silver por `ingestion_year`, `ingestion_month`, `ingestion_day`; Gold por `ciudad` (y `mes_anio` en patrones). Mejora lecturas y partition pruning.
-- **Uso estratégico de caché**: `df.cache()` y `df.count()` para materializar antes de varias acciones (count, show, write), evitando releer y recalcular desde S3.
-- **Shuffle**: `spark.sql.shuffle.partitions` (100 en Silver, 20 en Gold) para controlar tareas y evitar demasiados archivos pequeños en los `groupBy`.
+El pipeline implementa múltiples optimizaciones para reducir tiempo de ejecución y costos de S3.
+
+**Ver documento detallado:** [`OPTIMIZACIONES_PIPELINE.md`](./OPTIMIZACIONES_PIPELINE.md)
+
+**Resumen de técnicas aplicadas:**
+- Dynamic Partition Overwrite (Silver y Gold)
+- Partition Pruning en lecturas
+- Uso estratégico de caché
+- Control de shuffle partitions
+- Formato Parquet columnar con particionamiento
 
 ### 4. Configuración del entorno
 
@@ -283,11 +400,60 @@ Interfaz web de Spark: `http://<IP_PUBLICA>:8080`. Progreso del job: `http://<IP
 
 ---
 
-## 12. Tres puntos clave para la entrega
+## 12. Puntos clave para la entrega
 
-1. **Caché**: Uso de `.cache()` para evitar lecturas redundantes a S3 y reducir tiempo y coste.
-2. **Shuffle**: Ajuste de `spark.sql.shuffle.partitions` para no generar demasiadas tareas vacías y mejorar los `groupBy`.
-3. **Parquet**: Formato columnar en Silver y Gold para que las lecturas usen solo las columnas necesarias (partition pruning y mejor compresión).
+1. **Scripts PySpark**: `capa_silver.py` y `capa_gold.py` transforman datos para responder preguntas de negocio.
+2. **Formato Parquet**: Silver y Gold almacenan datos en formato columnar particionado.
+3. **Particionamiento**: Silver por `ciudad/event_year`, Gold por `ciudad/mes_anio`.
+4. **Optimizaciones**: Ver [`OPTIMIZACIONES_PIPELINE.md`](./OPTIMIZACIONES_PIPELINE.md) para detalles de Dynamic Partition Overwrite, caché, shuffle y partition pruning.
+
+---
+
+## 13. Estructura de particiones en Silver
+
+Después de ejecutar Silver, la estructura en S3 es:
+
+```
+s3://bucket-silver/silver/clima_procesado/
+├── ciudad=Patagonia/
+│   ├── event_year=2023/
+│   │   └── part-00000.parquet
+│   ├── event_year=2024/
+│   │   └── part-00000.parquet
+│   ├── event_year=2025/
+│   │   └── part-00000.parquet
+│   └── event_year=2026/          ← Se sobrescribe cada ejecución
+│       └── part-00000.parquet
+└── ciudad=Riohacha/
+    ├── event_year=2023/
+    ├── event_year=2024/
+    ├── event_year=2025/
+    └── event_year=2026/          ← Se sobrescribe cada ejecución
+```
+
+**Beneficios de esta estructura**:
+- Los datos históricos (2023-2025) permanecen intactos después de la primera carga.
+- Las ejecuciones diarias solo reprocesan y sobrescriben la partición del año actual (2026).
+- Gold lee todas las particiones como un solo dataset unificado.
+
+---
+
+## 14. Estructura de particiones en Gold
+
+```
+s3://bucket-gold/gold/
+├── resumen_clima_diario/
+│   ├── ciudad=Patagonia/
+│   │   ├── mes_anio=2024-01/
+│   │   │   └── part-00000.parquet
+│   │   └── ... (un folder por mes)
+│   └── ciudad=Riohacha/
+│       └── ... (misma estructura)
+└── patrones_horarios/
+    └── ... (misma estructura)
+```
+
+**Para detalles de optimización y beneficios, ver:** [`OPTIMIZACIONES_PIPELINE.md`](./OPTIMIZACIONES_PIPELINE.md)
 
 ---
 

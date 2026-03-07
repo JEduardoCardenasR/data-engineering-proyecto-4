@@ -5,9 +5,19 @@ Consigna:
 - Scripts PySpark que transforman datos para soportar las preguntas de negocio.
 - Combinar datos no estructurados (JSON histórico, JSONL stream) con fuentes
   estructuradas en el Data Lake; salida en formato Parquet (capa Silver).
-- Optimización: particionamiento por fecha, control de shuffle, memoria driver/executor.
+- Optimización: particionamiento por ciudad/año, control de shuffle, dynamic overwrite.
 
-Flujo: Raw (JSON/JSONL) → transformación y limpieza → Silver (Parquet particionado).
+Flujo:
+- PRIMERA EJECUCIÓN: Raw (históricos + stream) → Silver (Parquet particionado por ciudad/event_year)
+- EJECUCIONES POSTERIORES: Raw (solo stream) → Silver (sobrescribe solo partición del año actual)
+
+Particionamiento:
+- ciudad: Patagonia, Riohacha
+- event_year: año del evento (del dato), no de procesamiento
+
+Dynamic Partition Overwrite:
+- Los años anteriores (históricos) se cargan UNA SOLA VEZ
+- Las ejecuciones diarias solo procesan stream y sobrescriben la partición del año actual
 
 Ejecución: spark-submit --master <url> /app/capa_silver.py
            o: python3 /app/capa_silver.py (dentro del contenedor)
@@ -17,10 +27,13 @@ import sys
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, lit, round, from_unixtime, coalesce,
-    element_at, when, size
+    element_at, when, size, year
 )
 from pyspark.sql.types import StringType, DoubleType, LongType
 from datetime import datetime
+
+# Año actual para determinar qué datos procesar en ejecuciones incrementales
+CURRENT_YEAR = datetime.now().year  # 2026
 
 # CONFIGURACIÓN Y MANEJO DE VARIABLES DE ENTORNO
 
@@ -69,8 +82,9 @@ HISTORICAL_PATHS = [
 OUTPUT_PATH = f"s3a://{BUCKET_SILVER}/silver/clima_procesado/"
 
 print(f"--- INICIO ETL: Capa RAW a SILVER (data-engineering-proyecto-4) ---")
-print(f"✅ Leyendo {len(STREAM_PATHS)} rutas de stream (JSONL.GZ).")
-print(f"✅ Leyendo {len(HISTORICAL_PATHS)} rutas de históricos (JSON).")
+print(f"📅 Año actual configurado: {CURRENT_YEAR}")
+print(f"📂 Rutas de stream disponibles: {len(STREAM_PATHS)}")
+print(f"📂 Rutas de históricos disponibles: {len(HISTORICAL_PATHS)}")
 
 # CONFIGURACIÓN DE LA SESIÓN SPARK
 
@@ -79,10 +93,55 @@ spark = (
     # En lugar de access/secret key, usamos el proveedor de credenciales de la instancia
     .config("fs.s3a.aws.credentials.provider", "com.amazonaws.auth.InstanceProfileCredentialsProvider")
     .config("spark.sql.shuffle.partitions", "100")
+    # Dynamic partition overwrite: solo sobrescribe las particiones presentes en el DataFrame
+    .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
     .getOrCreate()
 )
 
 spark.sparkContext.setLogLevel("WARN")
+
+
+def check_historical_data_exists(spark_session, output_path, current_year):
+    """
+    Verifica si Silver ya tiene particiones de años anteriores CON archivos parquet.
+    No lee datos, solo verifica existencia de carpetas y archivos (eficiente).
+    Retorna True si existen datos históricos válidos, False si es primera ejecución.
+    """
+    try:
+        hadoop_conf = spark_session._jsc.hadoopConfiguration()
+        fs = spark_session._jvm.org.apache.hadoop.fs.FileSystem.get(
+            spark_session._jvm.java.net.URI(output_path), hadoop_conf
+        )
+        path = spark_session._jvm.org.apache.hadoop.fs.Path(output_path)
+        
+        if not fs.exists(path):
+            print(f"ℹ️ Silver no existe. Primera ejecución detectada.")
+            return False
+        
+        # Buscar particiones de años anteriores que tengan archivos .parquet
+        for city_status in fs.listStatus(path):
+            if city_status.isDirectory():
+                city_path = city_status.getPath()
+                for year_status in fs.listStatus(city_path):
+                    if year_status.isDirectory():
+                        dir_name = year_status.getPath().getName()
+                        if dir_name.startswith("event_year="):
+                            year_val = dir_name.split("=")[1]
+                            if year_val.isdigit() and int(year_val) < current_year:
+                                # Verificar que hay al menos 1 archivo .parquet
+                                year_path = year_status.getPath()
+                                for file_status in fs.listStatus(year_path):
+                                    if file_status.getPath().getName().endswith(".parquet"):
+                                        print(f"✅ Partición histórica válida: {dir_name} (con archivos parquet)")
+                                        return True
+        
+        print(f"ℹ️ No se encontraron particiones históricas válidas. Se procesarán históricos + stream.")
+        return False
+        
+    except Exception as e:
+        print(f"⚠️ Error verificando Silver: {e}. Asumiendo primera ejecución por seguridad.")
+        return False
+
 
 # FUNCIONES DE PROYECCIÓN Y APLANAMIENTO
 
@@ -93,10 +152,70 @@ def get_nested_field(struct_name, field_name):
 def safe_flatten_structs(df):
     """
     Asegura que el DataFrame tiene un esquema plano y uniforme para permitir la unión.
-    Maneja esquemas anidados (OpenWeatherMap) y esquemas planos (Patagonia/histórico).
+    Maneja esquemas anidados (OpenWeatherMap current weather), datos Airbyte onecall,
+    y esquemas planos (Patagonia/histórico).
     """
 
-    # Si 'main' existe, asumimos que es el esquema ANIDADO estándar de OpenWeatherMap.
+    # --- CASO 1: Datos Airbyte onecall (con _airbyte_data.current) ---
+    # Los datos de Airbyte onecall tienen la estructura: _airbyte_data.current.temp, etc.
+    is_airbyte_onecall = "_airbyte_data" in df.columns
+    
+    if is_airbyte_onecall:
+        print(f"Procesando esquema AIRBYTE ONECALL (extrayendo datos de _airbyte_data.current)...")
+        
+        # Extraer datos del objeto 'current' dentro de _airbyte_data
+        # Estructura: _airbyte_data.current.{temp, humidity, pressure, wind_speed, etc.}
+        current_data = col("_airbyte_data").getItem("current")
+        
+        df = df.withColumn("dt", current_data.getItem("dt").cast(LongType()))
+        # Conversión Kelvin → Celsius: OpenWeatherMap devuelve temp en Kelvin por defecto
+        df = df.withColumn("temperatura_c", round(current_data.getItem("temp") - lit(273.15), 2))
+        df = df.withColumn("humedad_porcentaje", current_data.getItem("humidity").cast(DoubleType()))
+        df = df.withColumn("presion_hpa", current_data.getItem("pressure").cast(DoubleType()))
+        df = df.withColumn("velocidad_viento_m_s", round(current_data.getItem("wind_speed"), 2))
+        df = df.withColumn("direccion_viento_grados", current_data.getItem("wind_deg").cast(DoubleType()))
+        df = df.withColumn("nubes_porcentaje", current_data.getItem("clouds").cast(DoubleType()))
+        df = df.withColumn("uv_index", current_data.getItem("uvi").cast(DoubleType()))
+        df = df.withColumn("visibility", current_data.getItem("visibility").cast(DoubleType()))
+        
+        # Lat/Lon están en el nivel superior de _airbyte_data
+        df = df.withColumn("lat", col("_airbyte_data").getItem("lat").cast(DoubleType()))
+        df = df.withColumn("lon", col("_airbyte_data").getItem("lon").cast(DoubleType()))
+        df = df.withColumn("timezone", col("_airbyte_data").getItem("timezone").cast(StringType()))
+        
+        # Weather array (descripción del clima)
+        weather_array = current_data.getItem("weather")
+        df = df.withColumn(
+            "clima_descripcion_corta",
+            when(weather_array.isNotNull() & (size(weather_array) >= 1),
+                 element_at(weather_array, 1).getItem("main")).otherwise(lit(None)).cast(StringType())
+        )
+        df = df.withColumn(
+            "clima_descripcion_larga",
+            when(weather_array.isNotNull() & (size(weather_array) >= 1),
+                 element_at(weather_array, 1).getItem("description")).otherwise(lit(None)).cast(StringType())
+        )
+        df = df.withColumn(
+            "clima_icono_id",
+            when(weather_array.isNotNull() & (size(weather_array) >= 1),
+                 element_at(weather_array, 1).getItem("icon")).otherwise(lit(None)).cast(StringType())
+        )
+        
+        # Rain y Snow (pueden no existir en current)
+        df = df.withColumn("rain_1h_mm", lit(None).cast(DoubleType()))
+        df = df.withColumn("snow_1h_mm", lit(None).cast(DoubleType()))
+        
+        # Eliminar columnas de Airbyte
+        airbyte_cols = [c for c in df.columns if c.startswith("_airbyte")]
+        if airbyte_cols:
+            df = df.drop(*airbyte_cols)
+            print(f"   Columnas Airbyte eliminadas: {airbyte_cols}")
+        
+        print(f"   Esquema Airbyte onecall aplanado exitosamente.")
+        return df
+
+    # --- CASO 2: Esquema ANIDADO estándar de OpenWeatherMap (current weather) ---
+    # Si 'main' existe, asumimos que es el esquema anidado estándar.
     is_nested_schema = "main" in df.columns
 
     if is_nested_schema:
@@ -108,8 +227,9 @@ def safe_flatten_structs(df):
         else:
             df = df.withColumn("dt", lit(None).cast(LongType()))
 
-        # Proyectar campos principales (CORRECCIÓN DE INDENTACIÓN APLICADA AQUÍ)
-        df = df.withColumn("temperatura_c", round(get_nested_field("main", "temp"), 2)) \
+        # Proyectar campos principales
+        # Conversión Kelvin → Celsius: OpenWeatherMap devuelve temp en Kelvin por defecto
+        df = df.withColumn("temperatura_c", round(get_nested_field("main", "temp") - lit(273.15), 2)) \
             .withColumn("humedad_porcentaje", get_nested_field("main", "humidity")) \
             .withColumn("presion_hpa", get_nested_field("main", "pressure")) \
             .withColumn("velocidad_viento_m_s", round(get_nested_field("wind", "speed"), 2)) \
@@ -281,20 +401,18 @@ def safe_flatten_structs(df):
 def finalize_silver_schema(df_raw_combinado):
     """
     Aplica las transformaciones finales y selecciona el esquema de Silver.
+    Particionamiento por ciudad y event_year (año del evento, no de procesamiento).
     """
     print("Aplicando transformaciones y limpieza final de datos...")
 
     processing_ts = datetime.now()
 
-    # Crear columnas de partición y de tiempo de procesamiento
+    # Crear columna de tiempo de procesamiento (auditoría) y event_year (partición)
     df_silver_partitioned = df_raw_combinado.withColumn(
         "fecha_procesamiento_utc", lit(processing_ts)
     ).withColumn(
-        "ingestion_year", lit(processing_ts.strftime("%Y")).cast(StringType())
-    ).withColumn(
-        "ingestion_month", lit(processing_ts.strftime("%m")).cast(StringType())
-    ).withColumn(
-        "ingestion_day", lit(processing_ts.strftime("%d")).cast(StringType())
+        # event_year: año del evento basado en el timestamp del dato
+        "event_year", year(from_unixtime(col("dt"))).cast(StringType())
     )
 
     # Seleccionar el esquema final de Silver (todas planas)
@@ -322,11 +440,9 @@ def finalize_silver_schema(df_raw_combinado):
         col("lat"),
         col("lon"),
         col("city_name").alias("ciudad"),
-        lit("observado").alias("origen_dato"),  # Permite comparar con datos de predicción si se cargan después
+        lit("observado").alias("origen_dato"),
         col("fecha_procesamiento_utc"),
-        col("ingestion_year"),
-        col("ingestion_month"),
-        col("ingestion_day")
+        col("event_year")
     )
 
     initial_count = df_silver.count()
@@ -349,11 +465,19 @@ def finalize_silver_schema(df_raw_combinado):
 data_frames = []
 
 try:
-    print(f"Cargando DataFrames de forma individual y aplanando el esquema...")
+    # Verificar si es primera ejecución (no hay datos históricos en Silver)
+    is_first_run = not check_historical_data_exists(spark, OUTPUT_PATH, CURRENT_YEAR)
 
+    if is_first_run:
+        print(f"\n🚀 PRIMERA EJECUCIÓN: Se procesarán históricos + stream.")
+    else:
+        print(f"\n🔄 EJECUCIÓN INCREMENTAL: Solo se procesará stream (año {CURRENT_YEAR}).")
+
+    print(f"Cargando DataFrames de forma individual y aplanando el esquema...")
 
     # ------------------------------------------------------------------
     # BLOQUE RESILIENTE: Leer datos de stream (JSONL.GZ en stream/.../onecall/)
+    # Siempre se procesan los datos de stream (año actual)
     # ------------------------------------------------------------------
     for path in STREAM_PATHS:
         try:
@@ -362,11 +486,18 @@ try:
                 spark.read
                 .option("mode", "PERMISSIVE")
                 .option("inferSchema", "true")
-                .json(path)  # Lee *.jsonl.gz (una línea = un JSON por registro)
+                .json(path)
             )
 
+            # Intentar obtener city_name de la columna 'name' si existe
             if "name" in df.columns:
                 df = df.withColumnRenamed("name", "city_name")
+            else:
+                # Si no existe 'name', extraer el nombre de la ciudad de la ruta
+                # Ruta: s3a://bucket/stream/Patagonia/onecall/ → ciudad = "Patagonia"
+                city_from_path = path.split("/stream/")[1].split("/")[0]
+                print(f"   ℹ️ Columna 'name' no encontrada. Usando ciudad de la ruta: {city_from_path}")
+                df = df.withColumn("city_name", lit(city_from_path))
 
             df = safe_flatten_structs(df)
             data_frames.append(df)
@@ -378,29 +509,32 @@ try:
 
     # ------------------------------------------------------------------
     # BLOQUE RESILIENTE: Leer datos históricos (JSON)
+    # Solo se procesan en la PRIMERA EJECUCIÓN
     # ------------------------------------------------------------------
-    for path in HISTORICAL_PATHS:
-        try:
-            print(f"\n   -> Leyendo JSON (histórico): {path}")
-            df = (
-                spark.read
-                .option("multiLine", "true")
-                .option("mode", "PERMISSIVE")
-                .option("inferSchema", "true")
-                .json(path)
-            )
+    if is_first_run:
+        for path in HISTORICAL_PATHS:
+            try:
+                print(f"\n   -> Leyendo JSON (histórico): {path}")
+                df = (
+                    spark.read
+                    .option("multiLine", "true")
+                    .option("mode", "PERMISSIVE")
+                    .option("inferSchema", "true")
+                    .json(path)
+                )
 
-            if "name" in df.columns:
-                df = df.withColumnRenamed("name", "city_name")
+                if "name" in df.columns:
+                    df = df.withColumnRenamed("name", "city_name")
 
-            df = safe_flatten_structs(df)
-            data_frames.append(df)
-            print(f"✅ Lectura de {path} exitosa.")
+                df = safe_flatten_structs(df)
+                data_frames.append(df)
+                print(f"✅ Lectura de {path} exitosa.")
 
-        except Exception as e:
-            # Captura y reporta el error, luego salta al siguiente archivo
-            print(f"\n❌ ERROR CRÍTICO: Falló la lectura/procesamiento del JSON en {path}. SALTANDO ARCHIVO.", file=sys.stderr)
-            print(f"   DETALLE DEL ERROR: {e}", file=sys.stderr)
+            except Exception as e:
+                print(f"\n❌ ERROR CRÍTICO: Falló la lectura/procesamiento del JSON en {path}. SALTANDO ARCHIVO.", file=sys.stderr)
+                print(f"   DETALLE DEL ERROR: {e}", file=sys.stderr)
+    else:
+        print(f"\n⏭️ Saltando históricos (ya procesados en ejecución anterior).")
 
 
 
@@ -440,15 +574,18 @@ try:
         sys.exit(1)
 
     # Escribir en Parquet (consigna: pasar datos a formato Parquet en el Data Lake)
-    # OPTIMIZACIÓN: particionamiento por fecha para lecturas eficientes y pruning en Gold
+    # Particionamiento por ciudad y event_year para organización lógica
+    # Dynamic partition overwrite: solo sobrescribe particiones presentes en el DataFrame
     print(f"Escribiendo {final_count} registros en Parquet (Silver): {OUTPUT_PATH}")
+    print(f"   Particiones: ciudad / event_year")
+    print(f"   Modo: dynamic overwrite (solo sobrescribe particiones del DataFrame actual)")
 
     (
         df_silver_final
-        .repartition(1, col("ingestion_year"), col("ingestion_month"), col("ingestion_day"))
+        .repartition(col("ciudad"), col("event_year"))
         .write
-        .mode("append")
-        .partitionBy("ingestion_year", "ingestion_month", "ingestion_day")
+        .mode("overwrite")
+        .partitionBy("ciudad", "event_year")
         .parquet(OUTPUT_PATH)
     )
 
