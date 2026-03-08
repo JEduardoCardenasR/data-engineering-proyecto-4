@@ -122,10 +122,23 @@ La comprobación se realizó revisando la presencia y estructura de los objetos 
 
 ---
 
-## 6. Diagrama del pipeline
+## 6. Integración con Airflow (orquestación)
 
-El diagrama de arquitectura del pipeline ETLT se encuentra en la carpeta **`diseño_pipeline/`** (incluye el notebook de documentación y el diagrama en formato Draw.io).
+Airflow orquesta el pipeline completo, incluida la **ingesta vía Airbyte**. En lugar de depender del schedule de Airbyte (p. ej. cada 24 h), el DAG `spark_etl_pipeline` dispara las sincronizaciones bajo demanda mediante la **API de Airbyte Cloud** con autenticación OAuth2 (Client Credentials).
+
+- **Credenciales**: En la instancia de Airflow se configuran en el archivo `.env` (no se suben a GitHub):
+  - `AIRBYTE_CLIENT_ID` y `AIRBYTE_CLIENT_SECRET`: obtenidos en Airbyte Cloud (API → Applications).
+  - `AIRBYTE_CONNECTION_ID_PATAGONIA` y `AIRBYTE_CONNECTION_ID_RIOHACHA`: UUIDs de las conexiones que escriben en `stream/Patagonia/` y `stream/Riohacha/`.
+- **Flujo**: El DAG obtiene un token con `POST /v1/applications/token` y luego dispara un job con `POST /v1/jobs` (connectionId + jobType sync) para cada ciudad. Cuando terminan las ingestas, Airflow continúa con la verificación SSH a Spark y la ejecución de las capas Silver y Gold.
+
+La documentación detallada del DAG y del archivo `.env` está en **`airflow/CONFIGURACION_Y_PUESTA_EN_MARCHA.md`** (secciones 5 y 9).
 
 ---
 
-*Documento de referencia de la ingesta a S3 mediante Airbyte para el proyecto data-engineering-proyecto-4. Para la ingesta desde archivos JSON locales, véase [INGESTA_JSON_LOCAL.md](INGESTA_JSON_LOCAL.md).*
+## 7. Diagrama del pipeline
+
+El diagrama de arquitectura del pipeline ETL se encuentra en la carpeta **`diseño_pipeline/`** (incluye el notebook de documentación y el diagrama en formato Draw.io).
+
+---
+
+*Documento de referencia de la ingesta a S3 mediante Airbyte para el proyecto data-engineering-proyecto-4. Para la ingesta desde archivos JSON locales, véase [INGESTA_JSON_LOCAL.md](INGESTA_JSON_LOCAL.md). Para la orquestación con Airflow y el uso del .env, véase [CONFIGURACION_Y_PUESTA_EN_MARCHA.md](../airflow/CONFIGURACION_Y_PUESTA_EN_MARCHA.md).*

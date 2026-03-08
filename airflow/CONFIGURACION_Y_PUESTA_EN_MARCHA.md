@@ -76,15 +76,14 @@ mkdir -p ~/airflow/{dags,logs,config,plugins}
 
 ## 5. Archivo `.env`
 
-Crear el archivo de variables de entorno:
+Crear el archivo de variables de entorno (puedes copiar `airflow/.env.example` como base y renombrarlo a `.env`):
 
 ```bash
-cat > ~/airflow/.env << 'EOF'
-AIRFLOW_UID=1000
-_AIRFLOW_WWW_USER_USERNAME=tu_usuario_airflow
-_AIRFLOW_WWW_USER_PASSWORD=tu_contraseña_segura
-EOF
+cp ~/airflow/.env.example ~/airflow/.env
+nano ~/airflow/.env
 ```
+
+Rellenar al menos las variables obligatorias. El `docker-compose` de Airflow carga este archivo (`env_file: .env`), por lo que el DAG tiene acceso a ellas para conectarse a Airbyte y usar la conexión SSH.
 
 ### Explicación de las variables
 
@@ -93,6 +92,12 @@ EOF
 | **AIRFLOW_UID** | Valor numérico del usuario en Ubuntu. Obtenerlo en la EC2 con: `echo $(id -u)`. En Ubuntu el primer usuario (p. ej. `ubuntu`) suele tener UID `1000`. Si no coincide, los archivos en `logs/`, `dags/`, etc. pueden quedar con permisos incorrectos. |
 | **_AIRFLOW_WWW_USER_USERNAME** | Usuario con el que accederás a la interfaz web de Airflow. |
 | **_AIRFLOW_WWW_USER_PASSWORD** | Contraseña para la interfaz web. **No uses valores por defecto en producción**; define una contraseña segura. |
+| **AIRBYTE_CLIENT_ID** | Client ID de la aplicación OAuth2 en Airbyte Cloud (API → Applications). Necesario para que el DAG dispare sincronizaciones vía API. |
+| **AIRBYTE_CLIENT_SECRET** | Client Secret de la misma aplicación. **No subas este valor a GitHub.** |
+| **AIRBYTE_CONNECTION_ID_PATAGONIA** | UUID de la conexión de Airbyte que ingesta datos de Patagonia (visible en la URL o en la API de Airbyte). |
+| **AIRBYTE_CONNECTION_ID_RIOHACHA** | UUID de la conexión de Airbyte que ingesta datos de Riohacha. |
+| **AIRFLOW_SSH_CONN_ID** | (Opcional) Connection Id de la conexión SSH en Airflow. Por defecto: `ssh_spark_server`. |
+| **SPARK_PROJECT_PATH** | (Opcional) Ruta del proyecto Spark en la instancia de Spark. Por defecto: `/home/ubuntu/spark-project`. |
 
 ---
 
@@ -240,23 +245,53 @@ Luego `docker-compose down` y `docker-compose up -d`. En la lista de conexiones,
 
 ## 9. DAG (spark_etl_pipeline)
 
+El DAG orquesta todo el pipeline: **ingesta con Airbyte** (vía API) y **procesamiento con Spark** (vía SSH). Las credenciales de Airbyte y los IDs de conexión se leen desde el archivo `.env` (no van en el código para no subirlas a GitHub).
+
+### Flujo del pipeline
+
+1. **Fase 1 – Ingesta (Airbyte)**  
+   - **trigger_airbyte_patagonia** y **trigger_airbyte_riohacha**: mediante `PythonOperator`, el DAG obtiene un token OAuth2 (Client Credentials) con `AIRBYTE_CLIENT_ID` y `AIRBYTE_CLIENT_SECRET`, y dispara un job de sincronización en Airbyte Cloud para cada conexión (Patagonia y Riohacha). Los datos se ingieren a S3 en las rutas configuradas en Airbyte.
+2. **Fase 2 – Verificación y procesamiento (Spark)**  
+   - **check_spark_connection**: Comprueba que `spark-master` y `spark-worker` estén arriba en la instancia de Spark.
+   - **run_capa_silver_etl**: Ejecuta `spark-submit /app/capa_silver.py` (Raw → Silver).
+   - **run_capa_gold_etl**: Ejecuta `spark-submit /app/capa_gold.py` (Silver → Gold).
+
+Las dos tareas de Airbyte se ejecutan en paralelo; cuando ambas terminan, se ejecutan en secuencia la verificación SSH y las capas Silver y Gold.
+
+### Integración Airflow–Airbyte
+
+La conexión con Airbyte se hace por **solicitudes HTTP desde el código** (no con un operador específico de Airbyte):
+
+- Se obtiene un **access token** con `POST https://api.airbyte.com/v1/applications/token` (grant_type `client_credentials`).
+- Con ese token se dispara el job con `POST https://api.airbyte.com/v1/jobs` (body: `connectionId`, `jobType: "sync"`).
+
+Los valores `AIRBYTE_CLIENT_ID`, `AIRBYTE_CLIENT_SECRET` y los IDs de conexión (`AIRBYTE_CONNECTION_ID_PATAGONIA`, `AIRBYTE_CONNECTION_ID_RIOHACHA`) deben estar definidos en `.env`; el DAG los lee con `os.environ.get(...)`.
+
+### Manejo de fallos y alertas
+
+El DAG está configurado para **reintentar** las tareas ante fallos y **registrar una alerta** cuando una tarea falla de forma definitiva:
+
+- **Reintentos**: Cada tarea tiene `retries: 3` y `retry_delay: timedelta(minutes=2)`. Si una tarea falla, Airflow la reintenta hasta 3 veces, esperando 2 minutos entre cada intento, antes de marcarla como fallida.
+- **Callback de fallo**: Cuando una tarea falla (tras agotar los reintentos), se ejecuta la función `notificar_error`. Esta función es un **callback** (`on_failure_callback`) que recibe el contexto de la ejecución y escribe en los logs del task una **alerta crítica** con:
+  - Identificador del DAG y de la tarea fallida.
+  - Fecha de ejecución.
+  - URL directa a los logs de esa tarea en la UI de Airflow (para revisar el error con rapidez).
+
+Así, al revisar los logs de una tarea fallida verás primero el mensaje de alerta y luego el detalle del error; la URL te lleva directamente a la misma ejecución en la interfaz web.
+
 ### Puntos importantes
 
-- **Ruta del proyecto en la EC2**: En el DAG se usa la variable `SPARK_PROJECT_PATH` (p. ej. `/home/ubuntu/spark-project`). Debe coincidir con la ruta real del proyecto en la instancia de Spark.
-- **Schedule**: Dejar `schedule_interval=None` para pruebas manuales; después se puede cambiar a un intervalo (p. ej. cada 12 h).
+- **Variables de entorno**: Asegúrate de tener en `.env` las variables de Airbyte y los IDs de conexión; si faltan, las tareas de Airbyte fallarán con un mensaje indicando qué variable falta.
+- **Ruta del proyecto en la EC2**: El DAG usa `SPARK_PROJECT_PATH` (por defecto `/home/ubuntu/spark-project`). Debe coincidir con la ruta real del proyecto en la instancia de Spark.
+- **Schedule**: Por defecto `schedule_interval=None` (solo ejecución manual); se puede cambiar a un intervalo (p. ej. cada 12 h).
 - **spark-submit**: El DAG usa `spark-submit` dentro del contenedor `spark-master`.
 - **Flag `-T`**: Se usa `docker-compose exec -T` para evitar problemas de TTY en ejecución no interactiva.
 
 ### Desplegar el DAG
 
 - Copiar `spark_etl_dag.py` en la carpeta `dags/` **dentro de la instancia** (en `~/airflow/dags/`).
+- Tener configurado `.env` con las variables de Airflow y Airbyte (ver sección 5).
 - Reiniciar o asegurarse de que los contenedores estén levantados: `docker-compose up -d`.
-
-El DAG hace:
-
-1. **check_spark_connection**: Comprueba que `spark-master` y `spark-worker` estén arriba.
-2. **run_capa_silver_etl**: Ejecuta `spark-submit /app/capa_silver.py` (Raw → Silver).
-3. **run_capa_gold_etl**: Ejecuta `spark-submit /app/capa_gold.py` (Silver → Gold).
 
 ---
 
@@ -276,9 +311,10 @@ El DAG hace:
 ### Qué ocurre al ejecutar
 
 1. El **Scheduler** detecta el trigger.
-2. **Tarea 1**: Airflow abre una conexión SSH a la IP de Spark y comprueba que `spark-master` y `spark-worker` estén activos. Si responden, la tarea pasa a éxito (verde).
-3. **Tarea 2**: Por el mismo túnel SSH, Airflow ejecuta `spark-submit /app/capa_silver.py` en el contenedor `spark-master`. Spark procesa y escribe en la capa Silver.
-4. **Tarea 3**: Igual para la capa Gold con `spark-submit /app/capa_gold.py`.
+2. **Tareas de Airbyte** (en paralelo): Airflow obtiene un token OAuth2 de Airbyte Cloud y dispara un job de sync para Patagonia y otro para Riohacha. Airbyte ingesta los datos a S3.
+3. **check_spark_connection**: Airflow abre una conexión SSH a la IP de Spark y comprueba que `spark-master` y `spark-worker` estén activos. Si responden, la tarea pasa a éxito (verde).
+4. **run_capa_silver_etl**: Por el mismo túnel SSH, Airflow ejecuta `spark-submit /app/capa_silver.py` en el contenedor `spark-master`. Spark procesa y escribe en la capa Silver.
+5. **run_capa_gold_etl**: Igual para la capa Gold con `spark-submit /app/capa_gold.py`.
 
 ---
 
@@ -290,8 +326,8 @@ En la vista del DAG, la columna **Recent Tasks** usa un código de colores:
 |----------------|-------------|
 | **Verde oscuro (Success)** | Tarea terminada correctamente. |
 | **Verde claro (Running)** | Tarea ejecutándose. |
-| **Rojo (Failed)** | Error (código, conexión, etc.). |
-| **Amarillo (Up for Retry)** | Falló y Airflow la reintentará según `retries`. |
+| **Rojo (Failed)** | Error (código, conexión, etc.). Tras agotar los reintentos se ejecuta el callback `notificar_error` y en los logs verás una alerta con el DAG, la tarea y la URL a los logs. |
+| **Amarillo (Up for Retry)** | Falló y Airflow la reintentará según `retries` (3 intentos, 2 min entre cada uno). |
 | **Gris claro (Queued)** | En cola, esperando ejecución. |
 | **Gris oscuro (Scheduled)** | Programada pero aún no en cola. |
 
@@ -302,7 +338,7 @@ El DAG ha terminado cuando todos los estados van al **verde oscuro (Success)** y
 ## 12. Ver el progreso (logs y Graph)
 
 1. En la UI, hacer clic en el **nombre del DAG** (`spark_etl_pipeline`).
-2. Ir a la pestaña **Graph**: se ven las tres tareas y sus dependencias.
+2. Ir a la pestaña **Graph**: se ven las tareas (Airbyte Patagonia/Riohacha, check Spark, Silver, Gold) y sus dependencias.
 3. Clic en una tarea (p. ej. `run_capa_silver_etl`) y elegir **Logs**. Ahí se ve la salida de Spark y cualquier `print()` de tu código.
 
 Mientras una tarea está en verde claro (Running), también puedes abrir en otra pestaña la **Spark Master UI**: `http://IP_PUBLICA_SPARK:8080`, y en “Running Applications” ver el job de la capa Silver/Gold. Para historial de aplicaciones, usar el Spark History Server (puerto 18080 si está configurado).
@@ -366,7 +402,7 @@ docker-compose down -v
 2. Asignar el mismo rol IAM que Spark (acceso S3).
 3. Instalar Docker y Docker Compose.
 4. Crear estructura `airflow/` con `dags/`, `logs/`, `config/`, `plugins/`, `.env`, `docker-compose.yaml`.
-5. Configurar `.env` (AIRFLOW_UID, usuario y contraseña web).
+5. Configurar `.env` (AIRFLOW_UID, usuario y contraseña web; y variables de Airbyte: client ID, client secret, IDs de conexión Patagonia y Riohacha).
 6. Configurar SSH en tu máquina para acceder a la instancia Airflow (y opcionalmente a Spark).
 7. Ejecutar `docker-compose up airflow-init` y luego `docker-compose up -d`.
 8. Generar llave SSH en Airflow, copiarla a `authorized_keys` de Spark, montar `~/.ssh` en el compose y crear la conexión `ssh_spark_server` en Admin → Connections.
