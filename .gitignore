@@ -3,3 +3,4 @@ data/
 
 # Credenciales (no subir .env)
 .env
+kafka/.env

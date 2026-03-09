@@ -30,6 +30,15 @@ RUN mkdir -p ${SPARK_HOME}/jars && \
     wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar -P ${SPARK_HOME}/jars && \
     wget -q https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar -P ${SPARK_HOME}/jars
 
+# --- JARs para Structured Streaming + Kafka (consumer_forecast.py) ---
+ENV SPARK_VERSION=3.5.0
+ENV KAFKA_CLIENTS_VERSION=3.4.1
+ENV COMMONS_POOL2_VERSION=2.11.1
+RUN wget -q https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/${SPARK_VERSION}/spark-sql-kafka-0-10_2.12-${SPARK_VERSION}.jar -P ${SPARK_HOME}/jars && \
+    wget -q https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/${SPARK_VERSION}/spark-token-provider-kafka-0-10_2.12-${SPARK_VERSION}.jar -P ${SPARK_HOME}/jars && \
+    wget -q https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar -P ${SPARK_HOME}/jars && \
+    wget -q https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/${COMMONS_POOL2_VERSION}/commons-pool2-${COMMONS_POOL2_VERSION}.jar -P ${SPARK_HOME}/jars
+
 # --- Directorio de trabajo y copiar código ---
 WORKDIR /app
 # Copiamos solo el contenido de nuestra carpeta app local

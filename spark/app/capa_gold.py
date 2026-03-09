@@ -268,32 +268,32 @@ try:
     # --- 6. ESCRITURA DE DATOS GOLD (con Dynamic Partition Overwrite) ---
 
     # 6.1. Escribir Resumen Diario en Parquet
-    # OPTIMIZACIÓN: Particionado por ciudad Y mes_anio para dynamic overwrite
-    # Solo sobrescribe las particiones del mes actual, los meses anteriores quedan intactos
+    # Un archivo por (ciudad, mes_anio): repartition(n) con n = nº de combinaciones distintas
     print(f"\nEscribiendo Resumen DIARIO GOLD (Parquet): {OUTPUT_PATH_DAILY}")
-    print(f"   Particiones: ciudad / mes_anio")
+    print(f"   Particiones: ciudad / mes_anio (1 archivo por partición)")
     print(f"   Modo: dynamic overwrite (solo sobrescribe mes actual: {CURRENT_YEAR_MONTH})")
 
+    n_daily = max(1, df_gold_daily.select("ciudad", "mes_anio").distinct().count())
     (
         df_gold_daily
-        .repartition(col("ciudad"), col("mes_anio"))
+        .repartition(n_daily, "ciudad", "mes_anio")
         .write
-        .mode("overwrite")  # Con partitionOverwriteMode=dynamic, solo toca particiones presentes
+        .mode("overwrite")
         .partitionBy("ciudad", "mes_anio")
         .parquet(OUTPUT_PATH_DAILY)
     )
 
     # 6.2. Escribir Patrones Horarios en Parquet
-    # Ya estaba particionado por ciudad/mes_anio, ahora con dynamic overwrite
     print(f"\nEscribiendo Patrones HORARIOS GOLD (Parquet): {OUTPUT_PATH_PATTERNS}")
-    print(f"   Particiones: ciudad / mes_anio")
+    print(f"   Particiones: ciudad / mes_anio (1 archivo por partición)")
     print(f"   Modo: dynamic overwrite (solo sobrescribe mes actual: {CURRENT_YEAR_MONTH})")
 
+    n_patterns = max(1, df_gold_patterns.select("ciudad", "mes_anio").distinct().count())
     (
         df_gold_patterns
-        .repartition(col("ciudad"), col("mes_anio"))
+        .repartition(n_patterns, "ciudad", "mes_anio")
         .write
-        .mode("overwrite")  # Con partitionOverwriteMode=dynamic, solo toca particiones presentes
+        .mode("overwrite")
         .partitionBy("ciudad", "mes_anio")
         .parquet(OUTPUT_PATH_PATTERNS)
     )

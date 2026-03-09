@@ -1,0 +1,43 @@
+# CI: lint y verificación de sintaxis/imports en código Python.
+# No ejecuta pipelines ni servicios; solo revisa estilo y que el código sea válido.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r streamlit/requirements.txt
+          pip install ruff
+
+      - name: Lint with Ruff (solo errores E/F: sintaxis y problemas de import/undefined)
+        run: |
+          . .venv/bin/activate
+          ruff check streamlit/ spark/app/ kafka/ ingesta/ --select E,F --output-format=github
+
+      - name: Check Python syntax (compile)
+        run: |
+          . .venv/bin/activate
+          python -m py_compile streamlit/app.py
+          python -m py_compile kafka/producer.py
+          python -m py_compile ingesta/upload_historicos_to_s3.py
+          python -m py_compile ingesta/con_s3.py
+          for f in spark/app/*.py; do python -m py_compile "$f"; done

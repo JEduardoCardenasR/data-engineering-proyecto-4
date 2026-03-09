@@ -58,7 +58,8 @@ En la instancia EC2 (por ejemplo en `~/airflow`):
 ```
 airflow/
 ├── dags/
-│   └── spark_etl_dag.py
+│   ├── spark_etl_dag.py
+│   └── forecast_dag.py
 ├── logs/
 ├── config/
 ├── plugins/
@@ -98,6 +99,8 @@ Rellenar al menos las variables obligatorias. El `docker-compose` de Airflow car
 | **AIRBYTE_CONNECTION_ID_RIOHACHA** | UUID de la conexión de Airbyte que ingesta datos de Riohacha. |
 | **AIRFLOW_SSH_CONN_ID** | (Opcional) Connection Id de la conexión SSH en Airflow. Por defecto: `ssh_spark_server`. |
 | **SPARK_PROJECT_PATH** | (Opcional) Ruta del proyecto Spark en la instancia de Spark. Por defecto: `/home/ubuntu/spark-project`. |
+| **AIRFLOW_SSH_KAFKA_CONN_ID** | (Opcional) Connection Id SSH para la instancia donde corre Kafka. Necesario para el DAG `forecast_pipeline`. Por defecto: `ssh_kafka_server`. |
+| **KAFKA_PROJECT_PATH** | (Opcional) Ruta del proyecto Kafka en la instancia de Kafka (donde está el `docker-compose` con el servicio `producer`). Por defecto: `/home/ubuntu/kafka-project`. |
 
 ---
 
@@ -241,6 +244,30 @@ AIRFLOW__CORE__TEST_CONNECTION: 'Enabled'
 
 Luego `docker-compose down` y `docker-compose up -d`. En la lista de conexiones, editar `ssh_spark_server` y usar el botón **Test**. Si el resultado es verde, Airflow puede ejecutar órdenes en Spark por SSH.
 
+### 8.8 Conexión SSH a la instancia de Kafka (para el DAG forecast_pipeline)
+
+El DAG **forecast_pipeline** dispara el producer de Kafka en la instancia donde corre Kafka. Necesitas una segunda conexión SSH.
+
+1. **Autorizar la misma llave de Airflow en la instancia de Kafka**  
+   En la instancia de Kafka (por SSH), añade la **misma** llave pública de Airflow (`~/.ssh/id_rsa.pub` de la instancia Airflow) en `~/.ssh/authorized_keys`. Así no hace falta generar otra llave; la que ya usas para Spark sirve también para Kafka.
+
+2. **Crear la conexión en la UI de Airflow**  
+   En **Admin → Connections**, **Add a new record**:
+
+| Campo | Valor |
+|-------|--------|
+| **Connection Id** | `ssh_kafka_server` |
+| **Connection Type** | SSH |
+| **Description** | Conexión SSH a la instancia de Kafka para ejecutar el producer (RUN_ONCE) |
+| **Host** | IP privada de tu instancia Kafka (ej. `172.31.x.x`) |
+| **Username** | ubuntu |
+| **Password** | (dejar vacío si usas llave) |
+| **Port** | 22 |
+| **Extra** | `{"key_file": "/opt/airflow/.ssh/id_rsa", "no_host_key_check": true}` |
+
+3. **Verificación**  
+   Desde la instancia de Airflow: `ssh ubuntu@IP_PRIVADA_DE_KAFKA`. Debe entrar sin contraseña. El montaje `~/.ssh` en el contenedor (sección 8.5) ya expone la misma llave a todos los operadores SSH.
+
 ---
 
 ## 9. DAG (spark_etl_pipeline)
@@ -295,26 +322,74 @@ Así, al revisar los logs de una tarea fallida verás primero el mensaje de aler
 
 ---
 
+## 9.1 DAG forecast_pipeline (Kafka → Gold)
+
+El archivo `forecast_dag.py` orquesta el pipeline de **pronósticos (forecast)** de punta a punta: inyecta datos en Kafka, los consume con Spark hasta RAW, y luego ejecuta Silver y Gold.
+
+### Flujo del pipeline
+
+1. **check_spark_connection**: Comprueba que `spark-master` y `spark-worker` estén activos en la instancia de Spark (misma conexión que el DAG principal).
+2. **trigger_producer**: Por SSH a la **instancia de Kafka**, ejecuta el producer **una sola vez** (`docker-compose run --rm -e RUN_ONCE=true producer`). El producer consulta la API OpenWeatherMap Forecast y publica mensajes en el topic `weather_forecast`. Requiere la conexión `ssh_kafka_server` y la variable `KAFKA_PROJECT_PATH`.
+3. **run_consumer_timeout**: Por SSH a Spark, ejecuta el consumer Spark (`consumer_forecast.py`) con un **timeout de 5 minutos** (`timeout 300`). El consumer es un job de streaming que escribe en S3 RAW cada 60 segundos; el timeout permite varios ciclos y persiste datos en `s3a://BUCKET_RAW/forecast/`.
+4. **run_silver_forecast**: Ejecuta `spark-submit /app/silver_forecast.py` (RAW forecast → Silver).
+5. **run_gold_forecast**: Ejecuta `spark-submit /app/gold_forecast.py` (Silver forecast → Gold).
+
+Orden: `check_spark_connection >> trigger_producer >> run_consumer_timeout >> run_silver_forecast >> run_gold_forecast`.
+
+### Variables y conexiones
+
+| Recurso | Uso |
+|--------|-----|
+| **ssh_spark_server** | check_spark_connection, run_consumer_timeout, run_silver_forecast, run_gold_forecast |
+| **ssh_kafka_server** | trigger_producer |
+| **SPARK_PROJECT_PATH** | Ruta del proyecto Spark en la EC2 de Spark (por defecto `/home/ubuntu/spark-project`). |
+| **KAFKA_PROJECT_PATH** | Ruta del proyecto Kafka en la EC2 de Kafka (por defecto `/home/ubuntu/kafka-project`). Debe contener el `docker-compose.yaml` con el servicio `producer`. |
+
+El DAG usa el mismo estilo de reintentos y alertas que `spark_etl_pipeline` (retries, retry_delay, on_failure_callback). Por defecto `schedule_interval=None` (solo ejecución manual).
+
+### Requisitos previos
+
+- **Instancia Kafka**: Broker y producer desplegados (`docker-compose up -d` en la instancia de Kafka). El producer puede estar en modo continuo; el DAG lanza un contenedor **adicional** con `RUN_ONCE=true` que termina tras una ráfaga.
+- **Instancia Spark**: Contenedores arriba y scripts `consumer_forecast.py`, `silver_forecast.py`, `gold_forecast.py` en `/app/` del `spark-master`. Variables de entorno del Spark (buckets, `KAFKA_BOOTSTRAP_SERVERS`) configuradas en el `.env` del proyecto Spark (ver `spark/CONFIGURACION_SPARK_EC2.md`).
+- **Conexión SSH a Kafka**: Sección 8.8.
+
+### Desplegar el DAG forecast_pipeline
+
+- Copiar `forecast_dag.py` en `~/airflow/dags/`.
+- Tener en `.env` (opcional si usas valores por defecto): `KAFKA_PROJECT_PATH`, y opcionalmente `AIRFLOW_SSH_KAFKA_CONN_ID`.
+- Crear la conexión `ssh_kafka_server` en Admin → Connections y autorizar la llave de Airflow en la instancia de Kafka.
+
+---
+
 ## 10. Ejecutar el DAG en Airflow
 
 ### Preparar las instancias
 
 - **Airflow**: contenedores en marcha en AWS (`docker-compose up -d` en la instancia de Airflow).
 - **Spark**: contenedores en marcha en AWS (`docker-compose up -d` en la instancia de Spark).
+- **Para el DAG forecast_pipeline**: además, la instancia de **Kafka** debe estar en marcha (`docker-compose up -d` en la instancia de Kafka).
 
 ### En la interfaz de Airflow
 
 1. Abrir `http://IP_AIRFLOW:8080`.
-2. Activar el DAG: poner el **toggle** junto al nombre del DAG en **ON**.
-3. Ejecutar una vez: botón **Trigger DAG** (icono de play a la derecha).
+2. Activar el DAG: poner el **toggle** junto al nombre del DAG en **ON** (cada DAG se activa por separado: `spark_etl_pipeline`, `forecast_pipeline`).
+3. Ejecutar una vez: botón **Trigger DAG** (icono de play a la derecha del DAG elegido).
 
-### Qué ocurre al ejecutar
+### Qué ocurre al ejecutar (DAG spark_etl_pipeline)
 
 1. El **Scheduler** detecta el trigger.
 2. **Tareas de Airbyte** (en paralelo): Airflow obtiene un token OAuth2 de Airbyte Cloud y dispara un job de sync para Patagonia y otro para Riohacha. Airbyte ingesta los datos a S3.
 3. **check_spark_connection**: Airflow abre una conexión SSH a la IP de Spark y comprueba que `spark-master` y `spark-worker` estén activos. Si responden, la tarea pasa a éxito (verde).
 4. **run_capa_silver_etl**: Por el mismo túnel SSH, Airflow ejecuta `spark-submit /app/capa_silver.py` en el contenedor `spark-master`. Spark procesa y escribe en la capa Silver.
 5. **run_capa_gold_etl**: Igual para la capa Gold con `spark-submit /app/capa_gold.py`.
+
+### Qué ocurre al ejecutar (DAG forecast_pipeline)
+
+1. **check_spark_connection**: Verificación SSH a Spark (igual que arriba).
+2. **trigger_producer**: SSH a la instancia de Kafka; se ejecuta `docker-compose run --rm -e RUN_ONCE=true producer`. El producer envía una ráfaga de pronósticos al topic `weather_forecast` y termina.
+3. **run_consumer_timeout**: SSH a Spark; se ejecuta el consumer con `timeout 900`. Durante hasta 15 minutos el consumer lee de Kafka y escribe en S3 RAW (forecast); luego la tarea termina (por timeout o cuando el proceso acaba).
+4. **run_silver_forecast**: `spark-submit /app/silver_forecast.py` (RAW forecast → Silver).
+5. **run_gold_forecast**: `spark-submit /app/gold_forecast.py` (Silver forecast → Gold).
 
 ---
 
@@ -337,8 +412,8 @@ El DAG ha terminado cuando todos los estados van al **verde oscuro (Success)** y
 
 ## 12. Ver el progreso (logs y Graph)
 
-1. En la UI, hacer clic en el **nombre del DAG** (`spark_etl_pipeline`).
-2. Ir a la pestaña **Graph**: se ven las tareas (Airbyte Patagonia/Riohacha, check Spark, Silver, Gold) y sus dependencias.
+1. En la UI, hacer clic en el **nombre del DAG** (`spark_etl_pipeline` o `forecast_pipeline`).
+2. Ir a la pestaña **Graph**: se ven las tareas y sus dependencias (en `forecast_pipeline`: check_spark_connection → trigger_producer → run_consumer_timeout → run_silver_forecast → run_gold_forecast).
 3. Clic en una tarea (p. ej. `run_capa_silver_etl`) y elegir **Logs**. Ahí se ve la salida de Spark y cualquier `print()` de tu código.
 
 Mientras una tarea está en verde claro (Running), también puedes abrir en otra pestaña la **Spark Master UI**: `http://IP_PUBLICA_SPARK:8080`, y en “Running Applications” ver el job de la capa Silver/Gold. Para historial de aplicaciones, usar el Spark History Server (puerto 18080 si está configurado).
@@ -402,9 +477,9 @@ docker-compose down -v
 2. Asignar el mismo rol IAM que Spark (acceso S3).
 3. Instalar Docker y Docker Compose.
 4. Crear estructura `airflow/` con `dags/`, `logs/`, `config/`, `plugins/`, `.env`, `docker-compose.yaml`.
-5. Configurar `.env` (AIRFLOW_UID, usuario y contraseña web; y variables de Airbyte: client ID, client secret, IDs de conexión Patagonia y Riohacha).
-6. Configurar SSH en tu máquina para acceder a la instancia Airflow (y opcionalmente a Spark).
+5. Configurar `.env` (AIRFLOW_UID, usuario y contraseña web; variables de Airbyte para `spark_etl_pipeline`; opcionalmente `KAFKA_PROJECT_PATH` y `AIRFLOW_SSH_KAFKA_CONN_ID` para `forecast_pipeline`).
+6. Configurar SSH en tu máquina para acceder a la instancia Airflow (y opcionalmente a Spark/Kafka).
 7. Ejecutar `docker-compose up airflow-init` y luego `docker-compose up -d`.
-8. Generar llave SSH en Airflow, copiarla a `authorized_keys` de Spark, montar `~/.ssh` en el compose y crear la conexión `ssh_spark_server` en Admin → Connections.
-9. Copiar el DAG a `dags/`, activar el DAG en la UI y hacer Trigger.
+8. Generar llave SSH en Airflow, copiarla a `authorized_keys` de Spark (y de Kafka si usas `forecast_pipeline`), montar `~/.ssh` en el compose y crear en Admin → Connections: `ssh_spark_server` y, para forecast, `ssh_kafka_server`.
+9. Copiar los DAGs (`spark_etl_dag.py`, `forecast_dag.py`) a `dags/`, activar el DAG en la UI y hacer Trigger.
 10. Revisar estados en Recent Tasks, logs en cada tarea y datos en S3; después ajustar `schedule_interval` si quieres ejecución automática.

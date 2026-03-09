@@ -1,0 +1,42 @@
+version: "3.8"
+services:
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: kafka
+    restart: unless-stopped
+    hostname: kafka
+    env_file:
+      - .env
+    environment:
+      KAFKA_NODE_ID: ${KAFKA_NODE_ID:-1}
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Canal para clientes (datos) y canal interno del controller (KRaft; no se usa Zookeeper/2181)
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      # IP y puerto que los clientes (Spark, producers, etc.) usan para conectar. Usar IP privada de esta instancia.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://${KAFKA_IP}:${KAFKA_PORT:-9092}
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: ${KAFKA_NODE_ID:-1}@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: ${KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR:-1}
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: ${KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR:-1}
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: ${KAFKA_TRANSACTION_STATE_LOG_MIN_ISR:-1}
+      KAFKA_NUM_PARTITIONS: ${KAFKA_NUM_PARTITIONS:-1}
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "${KAFKA_AUTO_CREATE_TOPICS_ENABLE:-true}"
+      KAFKA_CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    volumes:
+      - ./data:/var/lib/kafka/data
+
+  # Producer: OpenWeatherMap API → topic. Usa el mismo .env; conecta al servicio kafka por red interna.
+  producer:
+    build: .
+    container_name: kafka-producer
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Dentro de Docker el broker es el nombre del servicio, no la IP de la instancia.
+      KAFKA_IP: kafka
+      KAFKA_PORT: "9092"
+    depends_on:
+      - kafka

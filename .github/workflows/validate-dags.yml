@@ -1,0 +1,47 @@
+# Valida que los DAGs de Airflow se carguen sin errores de sintaxis o configuración.
+# No ejecuta tareas ni conecta a servicios externos.
+name: Validate Airflow DAGs
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  validate-dags:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Airflow (minimal for DAG validation)
+        env:
+          AIRFLOW_VERSION: 2.7.3
+          PYTHON_VERSION: "3.11"
+        run: |
+          pip install --upgrade pip
+          pip install "apache-airflow==${AIRFLOW_VERSION}" \
+            apache-airflow-providers-ssh \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+
+      - name: Validate DAGs
+        env:
+          AIRFLOW_HOME: /tmp/airflow_validate
+        run: |
+          python -c "
+from airflow.models import DagBag
+import os
+dags_path = os.path.join(os.getcwd(), 'airflow', 'dags')
+bag = DagBag(dags_folder=dags_path, include_examples=False)
+if bag.import_errors:
+    for f, err in bag.import_errors.items():
+        print(f'ERROR in {f}: {err}')
+    raise SystemExit(1)
+print('DAGs loaded:', list(bag.dag_ids))
+print('Validation OK.')
+"

@@ -1,0 +1,46 @@
+# Verifica que las imágenes Docker (Spark y Kafka) se construyan correctamente.
+# No hace push ni despliegue.
+name: Docker Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-spark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Spark image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./spark
+          file: ./spark/Dockerfile
+          push: false
+          tags: spark-local:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-kafka-producer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Kafka producer image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./kafka
+          file: ./kafka/Dockerfile
+          push: false
+          tags: kafka-producer:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -114,7 +114,10 @@ En la instancia (por ejemplo en `~/spark-project`):
 └── spark-project/              ← Directorio del proyecto (SPARK_PROJECT_PATH para Airflow)
     ├── app/                    ← Código montado en /app en el contenedor
     │   ├── capa_silver.py
-    │   └── capa_gold.py
+    │   ├── capa_gold.py
+    │   ├── consumer_forecast.py   # Streaming: Kafka → RAW forecast
+    │   ├── silver_forecast.py    # ETL: RAW forecast → Silver forecast
+    │   └── gold_forecast.py      # ETL: Silver forecast → Gold forecast
     ├── Dockerfile
     ├── docker-compose.yaml
     └── .env
@@ -131,7 +134,7 @@ cd spark-project
 
 ## 5. Archivo `.env`
 
-Solo son necesarios los nombres de buckets y la región. **No incluir credenciales AWS** si se usa IAM Role.
+Un solo archivo `.env` en la carpeta Spark alimenta **todos** los jobs: capa_silver, capa_gold, consumer_forecast, silver_forecast y gold_forecast. **No es necesario añadir variables** para los ETL de forecast; usan los mismos buckets. **No incluir credenciales AWS** si se usa IAM Role.
 
 ```bash
 nano .env
@@ -140,14 +143,31 @@ nano .env
 Contenido (reemplazar por tus nombres de bucket y región):
 
 ```env
-# Buckets S3
+# Buckets S3 (usados por todos los scripts: Silver, Gold, consumer y ETL forecast)
 BUCKET_NAME_RAW=tu-bucket-raw
 BUCKET_NAME_SILVER=tu-bucket-silver
 BUCKET_NAME_GOLD=tu-bucket-gold
 
 # Región (importante para Spark y S3)
 S3_REGION=us-east-2
+
+# Kafka (solo para consumer_forecast.py): IP:puerto del broker en la instancia Kafka
+KAFKA_BOOTSTRAP_SERVERS=IP_KAFKA:9092
 ```
+
+Si usas el consumer de forecast (`app/consumer_forecast.py`), define `KAFKA_BOOTSTRAP_SERVERS` con la IP privada (y puerto) de la instancia donde corre Kafka. Opcional: `KAFKA_TOPIC=weather_forecast` (por defecto ya es ese valor).
+
+### Variables de entorno por script
+
+| Script | Variables que usa | ¿Nuevas? |
+|--------|-------------------|----------|
+| capa_silver.py | BUCKET_NAME_RAW, BUCKET_NAME_SILVER | — |
+| capa_gold.py | BUCKET_NAME_SILVER, BUCKET_NAME_GOLD | — |
+| consumer_forecast.py | BUCKET_NAME_RAW, KAFKA_BOOTSTRAP_SERVERS (o KAFKA_IP + KAFKA_PORT), KAFKA_TOPIC opcional | — |
+| silver_forecast.py | BUCKET_NAME_RAW, BUCKET_NAME_SILVER | No; mismas que Silver/Gold |
+| gold_forecast.py | BUCKET_NAME_SILVER, BUCKET_NAME_GOLD | No; mismas que capa_gold |
+
+Con el contenido de `.env` anterior no hace falta modificar nada para ejecutar los ETL de forecast.
 
 Guardar: `Ctrl+O`, Enter, `Ctrl+X`. Verificar: `cat .env`.
 
@@ -161,7 +181,7 @@ Desde `~/spark-project`:
 nano Dockerfile
 ```
 
-Contenido (el del proyecto en `spark/Dockerfile`): imagen base `apache/spark:3.5.0`, Python, pip, `pandas`, `pyspark==3.5.0`, `boto3`, JARs S3A (hadoop-aws, aws-java-sdk-bundle), `WORKDIR /app`, `COPY ./app /app`, `CMD ["tail", "-f", "/dev/null"]`.
+Contenido (el del proyecto en `spark/Dockerfile`): imagen base `apache/spark:3.5.0`, Python, pip, `pandas`, `pyspark==3.5.0`, `boto3`, JARs S3A (hadoop-aws, aws-java-sdk-bundle), JARs Kafka (spark-sql-kafka-0-10, spark-token-provider-kafka-0-10, kafka-clients, commons-pool2) para `consumer_forecast.py`, `WORKDIR /app`, `COPY ./app /app`, `CMD ["tail", "-f", "/dev/null"]`.
 
 ---
 
@@ -196,7 +216,7 @@ docker ps
 docker exec -it spark-master ls /app
 ```
 
-Deben verse `capa_silver.py` y `capa_gold.py`.
+Deben verse `capa_silver.py`, `capa_gold.py`, `consumer_forecast.py`, `silver_forecast.py` y `gold_forecast.py`.
 
 ---
 
@@ -234,14 +254,98 @@ Si todo va bien, después se puede borrar `app/prueba_s3.py`.
 ## 10. Ejecutar ETL Silver y Gold
 
 ```bash
-# ETL Silver (Raw → Silver, Parquet)
+# ETL Silver (Raw → Silver, Parquet – clima stream/históricos)
 docker exec -it spark-master /opt/spark/bin/spark-submit /app/capa_silver.py
 
 # ETL Gold (Silver → Gold, Parquet)
 docker exec -it spark-master /opt/spark/bin/spark-submit /app/capa_gold.py
+
+# ETL Silver Forecast (RAW forecast → Silver forecast; ver 10c)
+docker exec -it spark-master /opt/spark/bin/spark-submit /app/silver_forecast.py
+
+# ETL Gold Forecast (Silver forecast → Gold forecast; ver 10d)
+docker exec -it spark-master /opt/spark/bin/spark-submit /app/gold_forecast.py
 ```
 
 Interfaz web de Spark: `http://<IP_PUBLICA>:8080`. Progreso del job: `http://<IP_PUBLICA>:4040` mientras corre un script.
+
+---
+
+## 10b. Consumer de forecast (Kafka → S3 RAW)
+
+El script **`app/consumer_forecast.py`** es un job de **Spark Structured Streaming** que lee mensajes del topic **`weather_forecast`** (Kafka), los particiona por ciudad/año/mes y escribe Parquet en **`s3a://BUCKET_NAME_RAW/forecast/`**. Es el downstream del producer de Kafka (ver `kafka/CONFIGURACION_KAFKA.md`).
+
+### Qué hace el proceso
+
+| Paso | Descripción |
+|------|-------------|
+| Entrada | Topic Kafka `weather_forecast` (mensajes publicados por `kafka/producer.py` con esquema forecast). |
+| Lectura | `readStream` desde el broker configurado en `KAFKA_BOOTSTRAP_SERVERS` (o `KAFKA_IP` + `KAFKA_PORT`). |
+| Transformación | Parsea JSON, deriva `year` y `month` de `forecast_time`, aplica `coalesce(1)` por micro-batch. |
+| Salida | Parquet en `s3a://BUCKET_NAME_RAW/forecast/` con `partitionBy("city", "year", "month")`. El detalle por día queda en la columna `forecast_time`. |
+| Trigger | Cada 60 s (o el valor configurado en el script) procesa un micro-batch. |
+
+### Variables de entorno necesarias
+
+En el `.env` de la carpeta Spark (el que carga el contenedor):
+
+- **`BUCKET_NAME_RAW`**: bucket donde se escribe la ruta `forecast/` (mismo que para Silver).
+- **`KAFKA_BOOTSTRAP_SERVERS`**: `IP_KAFKA:9092` (IP privada de la instancia donde corre Kafka). Opcional: `KAFKA_IP` y `KAFKA_PORT` por separado.
+- Opcional: **`KAFKA_TOPIC`** (por defecto `weather_forecast`).
+
+Ver sección **5. Archivo `.env`** en este mismo documento para el ejemplo de contenido.
+
+### Cómo ejecutarlo
+
+Es un job **de larga duración** (streaming): corre hasta que se detenga manualmente. Ejecutar desde el contenedor master. El Dockerfile incluye los JARs de Kafka en `/opt/spark/jars/`; hay que pasarlos con `--jars` para que Spark cargue el data source `kafka`:
+
+```bash
+docker exec -it spark-master /opt/spark/bin/spark-submit \
+  --jars /opt/spark/jars/spark-sql-kafka-0-10_2.12-3.5.0.jar,/opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.5.0.jar,/opt/spark/jars/kafka-clients-3.4.1.jar,/opt/spark/jars/commons-pool2-2.11.1.jar \
+  /app/consumer_forecast.py
+```
+
+El job mantendrá la sesión abierta; los datos se escriben en S3 según el trigger. Para dejarlo en segundo plano, usar `-d` o ejecutar en una sesión persistente (screen/nohup).
+
+### Documentación relacionada
+
+- **Kafka (producer y broker):** `kafka/CONFIGURACION_KAFKA.md`, `kafka/.env.example`.
+- **Esquema del topic:** coincide con el producer en `kafka/producer.py` (source, city, lat, lon, extraction_at, forecast_time, temp_c, humidity, wind_speed, clouds, weather_desc).
+
+---
+
+## 10c. Silver Forecast (RAW forecast → Silver forecast)
+
+El script **`app/silver_forecast.py`** lee los Parquet de **`s3a://BUCKET_NAME_RAW/forecast/`** (escritos por `consumer_forecast.py`), aplica limpieza, deduplicación por (city, forecast_time), enriquecimiento (p. ej. `sky_condition` por nubosidad) y escribe en **`s3a://BUCKET_NAME_SILVER/forecast/`** particionado por **city** y **year**, con overwrite dinámico (solo se sobrescriben las particiones escritas en esa ejecución).
+
+### Variables de entorno
+
+Las mismas que el resto de los ETL: **`BUCKET_NAME_RAW`** y **`BUCKET_NAME_SILVER`** (ver sección 5). No requiere variables adicionales.
+
+### Cuándo ejecutarlo
+
+Después de que el **consumer_forecast** haya escrito datos en RAW (ruta `forecast/`). Se puede ejecutar a demanda o integrarse en un cron/DAG (p. ej. después de un batch de consumer o en paralelo a capa_silver).
+
+### Comando
+
+```bash
+docker exec -it spark-master /opt/spark/bin/spark-submit /app/silver_forecast.py
+```
+
+---
+
+## 10d. Gold Forecast (Silver forecast → Gold)
+
+El script **`app/gold_forecast.py`** lee la capa Silver forecast (**`s3a://BUCKET_NAME_SILVER/forecast/`**), normaliza los nombres de columnas (p. ej. `wind_speed` → `velocidad_viento_m_s`, `temp_c` → `temperatura_c`, `clouds` → `nubes_porcentaje`) y aplica las mismas fórmulas de potencial que la Gold de clima: **WPI** (Wind Potential Index) y **SPI** (Solar Potential Index). Escribe en Gold:
+
+- **`s3a://BUCKET_NAME_GOLD/gold/forecast/resumen_clima_diario/`** (particionado por ciudad, mes_anio)
+- **`s3a://BUCKET_NAME_GOLD/gold/forecast/patrones_horarios/`** (particionado por ciudad, mes_anio)
+
+Variables de entorno: `BUCKET_NAME_SILVER`, `BUCKET_NAME_GOLD` (mismas que el resto de los ETL). Ejecutar después de `silver_forecast.py`:
+
+```bash
+docker exec -it spark-master /opt/spark/bin/spark-submit /app/gold_forecast.py
+```
 
 ---
 

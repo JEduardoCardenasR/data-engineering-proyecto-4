@@ -1,0 +1,7 @@
+# Consumo Gold - Streamlit dashboard
+# Lectura Parquet desde S3 (clima y forecast)
+streamlit>=1.28.0
+pandas>=2.0.0
+pyarrow>=14.0.0
+s3fs>=2023.10.0
+python-dotenv>=1.0.0
