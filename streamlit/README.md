@@ -19,7 +19,7 @@ Los datos están particionados por **ciudad** y **mes_anio**.
 ## Instalación
 
 ```bash
-cd Consumo
+cd streamlit
 pip install -r requirements.txt
 ```
 

@@ -33,15 +33,15 @@ jobs:
         env:
           AIRFLOW_HOME: /tmp/airflow_validate
         run: |
-          python -c "
-from airflow.models import DagBag
-import os
-dags_path = os.path.join(os.getcwd(), 'airflow', 'dags')
-bag = DagBag(dags_folder=dags_path, include_examples=False)
-if bag.import_errors:
-    for f, err in bag.import_errors.items():
-        print(f'ERROR in {f}: {err}')
-    raise SystemExit(1)
-print('DAGs loaded:', list(bag.dag_ids))
-print('Validation OK.')
-"
+          python << 'PY'
+          from airflow.models import DagBag
+          import os
+          dags_path = os.path.join(os.getcwd(), 'airflow', 'dags')
+          bag = DagBag(dags_folder=dags_path, include_examples=False)
+          if bag.import_errors:
+              for f, err in bag.import_errors.items():
+                  print(f'ERROR in {f}: {err}')
+              raise SystemExit(1)
+          print('DAGs loaded:', list(bag.dag_ids))
+          print('Validation OK.')
+          PY

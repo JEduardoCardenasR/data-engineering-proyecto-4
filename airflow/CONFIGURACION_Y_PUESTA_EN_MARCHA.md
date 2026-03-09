@@ -100,7 +100,7 @@ Rellenar al menos las variables obligatorias. El `docker-compose` de Airflow car
 | **AIRFLOW_SSH_CONN_ID** | (Opcional) Connection Id de la conexión SSH en Airflow. Por defecto: `ssh_spark_server`. |
 | **SPARK_PROJECT_PATH** | (Opcional) Ruta del proyecto Spark en la instancia de Spark. Por defecto: `/home/ubuntu/spark-project`. |
 | **AIRFLOW_SSH_KAFKA_CONN_ID** | (Opcional) Connection Id SSH para la instancia donde corre Kafka. Necesario para el DAG `forecast_pipeline`. Por defecto: `ssh_kafka_server`. |
-| **KAFKA_PROJECT_PATH** | (Opcional) Ruta del proyecto Kafka en la instancia de Kafka (donde está el `docker-compose` con el servicio `producer`). Por defecto: `/home/ubuntu/kafka-project`. |
+| **KAFKA_PROJECT_PATH** | (Opcional) Ruta del proyecto Kafka en la instancia de Kafka (donde está el `docker-compose` con el servicio `producer`). Por defecto: `/home/ubuntu/kafka`. |
 
 ---
 
@@ -330,7 +330,7 @@ El archivo `forecast_dag.py` orquesta el pipeline de **pronósticos (forecast)**
 
 1. **check_spark_connection**: Comprueba que `spark-master` y `spark-worker` estén activos en la instancia de Spark (misma conexión que el DAG principal).
 2. **trigger_producer**: Por SSH a la **instancia de Kafka**, ejecuta el producer **una sola vez** (`docker-compose run --rm -e RUN_ONCE=true producer`). El producer consulta la API OpenWeatherMap Forecast y publica mensajes en el topic `weather_forecast`. Requiere la conexión `ssh_kafka_server` y la variable `KAFKA_PROJECT_PATH`.
-3. **run_consumer_timeout**: Por SSH a Spark, ejecuta el consumer Spark (`consumer_forecast.py`) con un **timeout de 5 minutos** (`timeout 300`). El consumer es un job de streaming que escribe en S3 RAW cada 60 segundos; el timeout permite varios ciclos y persiste datos en `s3a://BUCKET_RAW/forecast/`.
+3. **run_consumer_timeout**: Por SSH a Spark, ejecuta el consumer Spark (`consumer_forecast.py`) con un **timeout de 5 minutos** (300 segundos). El consumer es un job de streaming que escribe en S3 RAW cada 60 segundos; el timeout permite varios ciclos y persiste datos en `s3a://BUCKET_RAW/forecast/`.
 4. **run_silver_forecast**: Ejecuta `spark-submit /app/silver_forecast.py` (RAW forecast → Silver).
 5. **run_gold_forecast**: Ejecuta `spark-submit /app/gold_forecast.py` (Silver forecast → Gold).
 
@@ -343,7 +343,7 @@ Orden: `check_spark_connection >> trigger_producer >> run_consumer_timeout >> ru
 | **ssh_spark_server** | check_spark_connection, run_consumer_timeout, run_silver_forecast, run_gold_forecast |
 | **ssh_kafka_server** | trigger_producer |
 | **SPARK_PROJECT_PATH** | Ruta del proyecto Spark en la EC2 de Spark (por defecto `/home/ubuntu/spark-project`). |
-| **KAFKA_PROJECT_PATH** | Ruta del proyecto Kafka en la EC2 de Kafka (por defecto `/home/ubuntu/kafka-project`). Debe contener el `docker-compose.yaml` con el servicio `producer`. |
+| **KAFKA_PROJECT_PATH** | Ruta del proyecto Kafka en la EC2 de Kafka (por defecto `/home/ubuntu/kafka`). Debe contener el `docker-compose.yaml` con el servicio `producer`. |
 
 El DAG usa el mismo estilo de reintentos y alertas que `spark_etl_pipeline` (retries, retry_delay, on_failure_callback). Por defecto `schedule_interval=None` (solo ejecución manual).
 
@@ -387,7 +387,7 @@ El DAG usa el mismo estilo de reintentos y alertas que `spark_etl_pipeline` (ret
 
 1. **check_spark_connection**: Verificación SSH a Spark (igual que arriba).
 2. **trigger_producer**: SSH a la instancia de Kafka; se ejecuta `docker-compose run --rm -e RUN_ONCE=true producer`. El producer envía una ráfaga de pronósticos al topic `weather_forecast` y termina.
-3. **run_consumer_timeout**: SSH a Spark; se ejecuta el consumer con `timeout 900`. Durante hasta 15 minutos el consumer lee de Kafka y escribe en S3 RAW (forecast); luego la tarea termina (por timeout o cuando el proceso acaba).
+3. **run_consumer_timeout**: SSH a Spark; se ejecuta el consumer con un timeout de **5 minutos** (300 s). Durante ese tiempo el consumer lee de Kafka y escribe en S3 RAW (forecast); luego la tarea termina (por timeout o cuando el proceso acaba).
 4. **run_silver_forecast**: `spark-submit /app/silver_forecast.py` (RAW forecast → Silver).
 5. **run_gold_forecast**: `spark-submit /app/gold_forecast.py` (Silver forecast → Gold).
 

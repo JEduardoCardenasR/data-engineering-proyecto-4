@@ -28,7 +28,7 @@ jobs:
           pip install -r streamlit/requirements.txt
           pip install ruff
 
-      - name: Lint with Ruff (solo errores E/F: sintaxis y problemas de import/undefined)
+      - name: "Lint with Ruff (solo errores E/F; sintaxis y problemas de import/undefined)"
         run: |
           . .venv/bin/activate
           ruff check streamlit/ spark/app/ kafka/ ingesta/ --select E,F --output-format=github

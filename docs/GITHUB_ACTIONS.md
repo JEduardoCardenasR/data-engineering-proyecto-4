@@ -14,8 +14,11 @@ data-engineering-proyecto-4/
 │       ├── validate-dags.yml   # Validación de DAGs de Airflow
 │       └── docker-build.yml   # Build de imágenes Docker (Spark y Kafka)
 └── docs/
-    └── GITHUB_ACTIONS.md       # Este archivo
+    ├── GITHUB_ACTIONS.md    # Este archivo
+    └── README.md            # Índice de toda la documentación del proyecto
 ```
+
+Para el índice completo de documentación (Airflow, Spark, Kafka, ingesta, Streamlit), véase [README.md](README.md) en esta carpeta o el [README principal del proyecto](../README.md).
 
 ---
 
